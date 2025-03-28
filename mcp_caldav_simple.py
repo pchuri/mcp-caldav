@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """
 CalDAV MCP 서버 - 최소 의존성 버전
+환경변수에서 서버 URL, 사용자 이름, 비밀번호를 읽어올 수 있습니다.
 """
 import logging
-import uuid
+import os
 from datetime import datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 
@@ -14,102 +15,140 @@ logger = logging.getLogger(__name__)
 # MCP 서버 생성
 mcp = FastMCP("MCP-CalDAV")
 
-# CalDAV 클라이언트 저장소
-caldav_clients = {}
+# 전역 CalDAV 클라이언트 설정
+caldav_client = None
+principal = None
 
-# 리소스 관련 함수들
-@mcp.resource(uri="calendars://{client_id}")
-def get_calendars(client_id: str) -> list:
-    """사용자의 모든 캘린더 목록을 가져옵니다."""
-    if client_id not in caldav_clients:
-        raise ValueError("유효하지 않은 클라이언트 ID입니다. 먼저 connect_caldav를 호출하세요.")
+def get_events(calendar_id: str, time_min: str, time_max: str, expand: bool = True, 
+              event_type: str = "event", category: str = None) -> list:
+    """
+    특정 캘린더의 이벤트를 가져옵니다.
+    
+    Args:
+        calendar_id: 캘린더 URL
+        time_min: 검색 시작 시간 (ISO 포맷)
+        time_max: 검색 종료 시간 (ISO 포맷)
+        expand: 반복 이벤트를 확장할지 여부 (기본값: True)
+        event_type: 조회할 이벤트 유형 ('event', 'todo', 'journal' 중 하나)
+        category: 특정 카테고리로 필터링 (선택사항)
+    """
+    if caldav_client is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
     
     try:
-        client = caldav_clients[client_id]
-        principal = client.principal()
-        calendars = principal.calendars()
-        
-        result = []
-        for calendar in calendars:
-            result.append({
-                "id": calendar.url,
-                "name": calendar.name,
-                "description": getattr(calendar, "description", ""),
-                "color": getattr(calendar, "color", "")
-            })
-        
-        return result
-    except Exception as e:
-        logger.error(f"캘린더 목록 조회 오류: {str(e)}")
-        raise ValueError(f"캘린더 목록 가져오기 실패: {str(e)}")
-
-@mcp.resource(uri="events://{client_id}/{calendar_id}")
-def get_events_wrapper(client_id: str, calendar_id: str) -> list:
-    """이벤트 리소스 래퍼"""
-    # 현재부터 30일 범위의 이벤트를 반환
-    now = datetime.now()
-    time_min = now.isoformat()
-    time_max = (now + timedelta(days=30)).isoformat()
-    return get_events(client_id, calendar_id, time_min, time_max)
-
-def get_events(client_id: str, calendar_id: str, time_min: str, time_max: str) -> list:
-    """특정 캘린더의 이벤트를 가져옵니다."""
-    if client_id not in caldav_clients:
-        raise ValueError("유효하지 않은 클라이언트 ID입니다. 먼저 connect_caldav를 호출하세요.")
-    
-    try:
-        client = caldav_clients[client_id]
-        calendar = client.calendar(url=calendar_id)
+        calendar = caldav_client.calendar(url=calendar_id)
         
         # 시간 범위 설정
         start_time = datetime.fromisoformat(time_min.replace('Z', '+00:00'))
         end_time = datetime.fromisoformat(time_max.replace('Z', '+00:00'))
         
-        # 이벤트 조회
-        events = calendar.date_search(start=start_time, end=end_time)
+        # 검색 매개변수 설정
+        search_params = {
+            'start': start_time,
+            'end': end_time,
+            'expand': expand
+        }
+        
+        # 이벤트 유형 설정
+        if event_type.lower() == 'event':
+            search_params['event'] = True
+        elif event_type.lower() == 'todo':
+            search_params['todo'] = True
+        elif event_type.lower() == 'journal':
+            search_params['journal'] = True
+            
+        # 카테고리 필터링 추가
+        if category:
+            search_params['category'] = category
+            
+        # 이벤트 검색 - search 메서드 사용
+        events = calendar.search(**search_params)
         
         result = []
         for event in events:
-            event_data = event.data
-            vevent = event.vobject_instance.vevent
-            
-            result.append({
-                "id": event.url,
-                "uid": str(vevent.uid.value) if hasattr(vevent, 'uid') else None,
-                "summary": str(vevent.summary.value) if hasattr(vevent, 'summary') else "제목 없음",
-                "start": str(vevent.dtstart.value) if hasattr(vevent, 'dtstart') else None,
-                "end": str(vevent.dtend.value) if hasattr(vevent, 'dtend') else None,
-                "location": str(vevent.location.value) if hasattr(vevent, 'location') else "",
-                "description": str(vevent.description.value) if hasattr(vevent, 'description') else ""
-            })
+            try:
+                # icalendar_component를 우선 사용해보고, 실패하면 vobject_instance로 대체
+                try:
+                    ical_comp = event.icalendar_component
+                    result.append({
+                        "id": event.url,
+                        "uid": str(ical_comp.get("uid", "")),
+                        "summary": str(ical_comp.get("summary", "제목 없음")),
+                        "start": str(ical_comp.get("dtstart").dt if 'dtstart' in ical_comp else None),
+                        "end": str(ical_comp.get("dtend").dt if 'dtend' in ical_comp else None),
+                        "location": str(ical_comp.get("location", "")),
+                        "description": str(ical_comp.get("description", ""))
+                    })
+                except Exception:
+                    # icalendar_component 접근 실패 시 vobject_instance 사용
+                    vevent = event.vobject_instance.vevent
+                    result.append({
+                        "id": event.url,
+                        "uid": str(vevent.uid.value) if hasattr(vevent, 'uid') else None,
+                        "summary": str(vevent.summary.value) if hasattr(vevent, 'summary') else "제목 없음",
+                        "start": str(vevent.dtstart.value) if hasattr(vevent, 'dtstart') else None,
+                        "end": str(vevent.dtend.value) if hasattr(vevent, 'dtend') else None,
+                        "location": str(vevent.location.value) if hasattr(vevent, 'location') else "",
+                        "description": str(vevent.description.value) if hasattr(vevent, 'description') else ""
+                    })
+            except Exception as item_err:
+                logger.warning(f"이벤트 정보 처리 중 오류: {str(item_err)}")
+                # 최소한의 정보만 포함
+                result.append({
+                    "id": event.url,
+                    "summary": "정보를 가져올 수 없는 이벤트",
+                    "start": None,
+                    "end": None
+                })
         
         return result
     except Exception as e:
         logger.error(f"이벤트 조회 오류: {str(e)}")
         raise ValueError(f"이벤트 가져오기 실패: {str(e)}")
 
-# 도구 관련 함수들
 @mcp.tool(name="connect_caldav")
-def connect_caldav(server_url: str, username: str, password: str) -> dict:
-    """CalDAV 서버에 연결하고 인증합니다."""
+def connect_caldav() -> dict:
+    global caldav_client, principal
+    
     try:
+        # 환경변수 또는 파라미터에서 연결 정보 가져오기
+        final_server_url = os.environ.get('CALDAV_URL')
+        final_username = os.environ.get('CALDAV_USERNAME')
+        final_password = os.environ.get('CALDAV_PASSWORD')
+        
+        # 필수 정보 확인
+        if not final_server_url:
+            raise ValueError("서버 URL이 제공되지 않았습니다. 파라미터 또는 환경변수 CALDAV_URL을 설정하세요.")
+        if not final_username:
+            raise ValueError("사용자 이름이 제공되지 않았습니다. 파라미터 또는 환경변수 CALDAV_USERNAME을 설정하세요.")
+        if not final_password:
+            raise ValueError("비밀번호가 제공되지 않았습니다. 파라미터 또는 환경변수 CALDAV_PASSWORD을 설정하세요.")
+        
+        # URL에 scheme이 없는 경우 https:// 추가
+        if not final_server_url.startswith(('http://', 'https://')):
+            logger.info("URL에 스킴이 없습니다. 'https://'를 추가합니다.")
+            final_server_url = 'https://' + final_server_url
+        
         # CalDAV 서버에 연결
         import caldav
-        client = caldav.DAVClient(
-            url=server_url,
-            username=username,
-            password=password
+        
+        # URL에 사용자 ID 포함 - LINE Works CalDAV 패턴 사용
+        if not '/principals/users/' in final_server_url and not '/calendars/' in final_server_url:
+            final_server_url = f"{final_server_url.rstrip('/')}/principals/users/{final_username}"
+            logger.info(f"URL에 사용자 ID를 포함시켰습니다: {final_server_url}")
+        
+        caldav_client = caldav.DAVClient(
+            url=final_server_url,
+            username=final_username,
+            password=final_password
         )
         
         # 연결 테스트
-        principal = client.principal()
+        principal = caldav_client.principal()
         
-        # 클라이언트 ID 생성 및 저장
-        client_id = str(uuid.uuid4())
-        caldav_clients[client_id] = client
+        logger.info(f"CalDAV 서버 '{final_server_url}'에 사용자 '{final_username}'로 성공적으로 연결되었습니다.")
         
         return {
-            "client_id": client_id,
             "status": "connected",
             "message": "CalDAV 서버에 성공적으로 연결되었습니다."
         }
@@ -117,41 +156,48 @@ def connect_caldav(server_url: str, username: str, password: str) -> dict:
         logger.error(f"CalDAV 연결 오류: {str(e)}")
         raise ValueError(f"CalDAV 연결 실패: {str(e)}")
 
-@mcp.tool(name="create_event")
-def create_event(client_id: str, calendar_id: str, summary: str, start: str, end: str, 
-               location: str = "", description: str = "") -> dict:
-    """캘린더에 새 이벤트를 생성합니다."""
-    if client_id not in caldav_clients:
-        raise ValueError("유효하지 않은 클라이언트 ID입니다. 먼저 connect_caldav를 호출하세요.")
+@mcp.tool(name="caldav_create_event")
+def create_event(calendar_id: str, summary: str, start: str, end: str, 
+               location: str = "", description: str = "", rrule: dict = None) -> dict:
+    """
+    캘린더에 새 이벤트를 생성합니다.
+    
+    Args:
+        calendar_id: 캘린더 URL
+        summary: 이벤트 제목
+        start: 시작 시간 (ISO 포맷)
+        end: 종료 시간 (ISO 포맷)
+        location: 위치 (선택사항)
+        description: 설명 (선택사항)
+        rrule: 반복 규칙 (예: {"FREQ": "DAILY"}, 선택사항)
+    """
+    if principal is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
     
     try:
-        client = caldav_clients[client_id]
-        calendar = client.calendar(url=calendar_id)
+        calendar = principal.calendar(cal_url=calendar_id)
         
-        # 이벤트 생성
-        event_id = str(uuid.uuid4())
+        # 시작 및 종료 시간 변환
+        dtstart = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        dtend = datetime.fromisoformat(end.replace('Z', '+00:00'))
         
-        # iCalendar 형식의 이벤트 데이터 생성
-        ical_data = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Anthropic MPC-CalDAV//EN
-BEGIN:VEVENT
-UID:{event_id}
-DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}
-DTSTART:{datetime.fromisoformat(start.replace('Z', '+00:00')).strftime('%Y%m%dT%H%M%SZ')}
-DTEND:{datetime.fromisoformat(end.replace('Z', '+00:00')).strftime('%Y%m%dT%H%M%SZ')}
-SUMMARY:{summary}
-LOCATION:{location}
-DESCRIPTION:{description}
-END:VEVENT
-END:VCALENDAR"""
+        # 예제 코드의 save_event 메서드 사용
+        # 이 방법은 add_event 보다 더 높은 수준의 추상화를 제공합니다
+        event = calendar.save_event(
+            dtstart=dtstart,
+            dtend=dtend, 
+            summary=summary,
+            location=location,
+            description=description,
+            rrule=rrule
+        )
         
-        # 이벤트 추가
-        event = calendar.add_event(ical_data)
+        # 이벤트 ID 추출
+        uid = event.icalendar_component["uid"]
         
         return {
             "id": event.url,
-            "uid": event_id,
+            "uid": str(uid),
             "status": "created",
             "message": "이벤트가 성공적으로 생성되었습니다."
         }
@@ -160,15 +206,14 @@ END:VCALENDAR"""
         raise ValueError(f"이벤트 생성 실패: {str(e)}")
 
 @mcp.tool(name="update_event")
-def update_event(client_id: str, event_id: str, summary: str = None, start: str = None, 
+def update_event(event_id: str, summary: str = None, start: str = None, 
                end: str = None, location: str = None, description: str = None) -> dict:
     """기존 이벤트를 업데이트합니다."""
-    if client_id not in caldav_clients:
-        raise ValueError("유효하지 않은 클라이언트 ID입니다. 먼저 connect_caldav를 호출하세요.")
+    if principal is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
     
     try:
-        client = caldav_clients[client_id]
-        event = client.event_by_url(event_id)
+        event = principal.event_by_url(event_id)
         
         # 이벤트 데이터 가져오기
         vevent = event.vobject_instance.vevent
@@ -207,15 +252,14 @@ def update_event(client_id: str, event_id: str, summary: str = None, start: str 
         logger.error(f"이벤트 업데이트 오류: {str(e)}")
         raise ValueError(f"이벤트 업데이트 실패: {str(e)}")
 
-@mcp.tool(name="delete_event")
-def delete_event(client_id: str, event_id: str) -> dict:
+@mcp.tool(name="caldav_delete_event")
+def delete_event(event_id: str) -> dict:
     """이벤트를 삭제합니다."""
-    if client_id not in caldav_clients:
-        raise ValueError("유효하지 않은 클라이언트 ID입니다. 먼저 connect_caldav를 호출하세요.")
+    if caldav_client is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
     
     try:
-        client = caldav_clients[client_id]
-        event = client.event_by_url(event_id)
+        event = caldav_client.event_by_url(event_id)
         
         # 이벤트 삭제
         event.delete()
@@ -229,17 +273,78 @@ def delete_event(client_id: str, event_id: str) -> dict:
         logger.error(f"이벤트 삭제 오류: {str(e)}")
         raise ValueError(f"이벤트 삭제 실패: {str(e)}")
 
-# 사용 예시 프롬프트 추가
-@mcp.prompt()
-def connect_caldav_prompt() -> str:
-    """CalDAV 서버 연결을 위한 프롬프트"""
-    return """
-    아래 정보를 입력하여 CalDAV 서버에 연결해주세요:
+@mcp.tool(name="caldav_list_calendars")
+def list_calendars() -> dict:
+    """사용자의 모든 캘린더 목록을 가져옵니다."""
+    if caldav_client is None or principal is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
     
-    서버 URL: (예: https://nextcloud.example.com/remote.php/dav/)
-    사용자 이름: 
-    비밀번호: 
-    """
+    try:
+        # 방법 1: 기본 calendars() 메서드 사용 시도
+        try:
+            calendars = principal.calendars()
+            logger.info("calendars() 메서드를 사용하여 캘린더 목록을 가져왔습니다.")
+        except Exception as e1:
+            logger.warning(f"calendars() 메서드 실패: {str(e1)}")
+            
+            # 방법 2: calendar_home_set 속성 사용 시도
+            try:
+                calendar_home = principal.calendar_home_set[0]
+                calendars = calendar_home.calendars()
+                logger.info("calendar_home_set을 사용하여 캘린더 목록을 가져왔습니다.")
+            except (IndexError, AttributeError, TypeError) as e2:
+                logger.warning(f"calendar_home_set 방법 실패: {str(e2)}")
+                
+                # 방법 3: 직접 캘린더 URL 구성 시도
+                try:
+                    username = caldav_client.username
+                    if isinstance(username, bytes):
+                        username = username.decode('utf-8')
+                    
+                    # LINE Works CalDAV 서버의 캘린더 URL 패턴 사용
+                    calendar_home_url = f"{caldav_client.url.rstrip('/')}/calendars/{username}/"
+                    calendar_home = caldav_client.calendar(url=calendar_home_url)
+                    calendars = [calendar_home]  # 캘린더 홈을 첫 번째 캘린더로 간주
+                    logger.info(f"직접 URL 구성을 사용하여 캘린더 목록을 가져왔습니다: {calendar_home_url}")
+                except Exception as e3:
+                    logger.error(f"직접 URL 구성 방법도 실패: {str(e3)}")
+                    # 모든 방법 실패 시 빈 목록 반환
+                    calendars = []
+        
+        calendar_list = []
+        for calendar in calendars:
+            try:
+                name = getattr(calendar, "name", "Unknown")
+                # name이 None이거나 AttributeError 발생 시 URL에서 이름 추출 시도
+                if name is None or name == "Unknown":
+                    url_parts = calendar.url.rstrip('/').split('/')
+                    name = url_parts[-1] if url_parts else "Unknown"
+                
+                calendar_list.append({
+                    "id": calendar.url,
+                    "name": name,
+                    "description": getattr(calendar, "description", ""),
+                    "color": getattr(calendar, "color", "")
+                })
+            except Exception as cal_err:
+                logger.warning(f"캘린더 정보 처리 중 오류: {str(cal_err)}")
+                # 최소한의 정보만 포함
+                calendar_list.append({
+                    "id": getattr(calendar, "url", "unknown"),
+                    "name": "Unknown Calendar",
+                    "description": "",
+                    "color": ""
+                })
+        
+        return {
+            "calendars": calendar_list,
+            "count": len(calendar_list),
+            "status": "success",
+            "message": f"{len(calendar_list)}개의 캘린더를 찾았습니다."
+        }
+    except Exception as e:
+        logger.error(f"캘린더 목록 조회 오류: {str(e)}")
+        raise ValueError(f"캘린더 목록 가져오기 실패: {str(e)}")
 
 @mcp.prompt()
 def create_event_prompt() -> str:
@@ -254,7 +359,32 @@ def create_event_prompt() -> str:
     설명: (선택사항)
     """
 
+@mcp.prompt()
+def list_calendars_prompt() -> str:
+    """캘린더 목록 조회를 위한 프롬프트"""
+    return """
+    CalDAV 서버에 연결된 계정의 모든 캘린더 목록을 조회합니다.
+    먼저 connect_caldav를 호출하여 서버에 연결해야 합니다.
+    """
+
+def _connect_caldav():
+    # 환경변수에서 연결 정보 확인
+    caldav_url = os.environ.get('CALDAV_URL')
+    caldav_username = os.environ.get('CALDAV_USERNAME')
+    caldav_password = os.environ.get('CALDAV_PASSWORD')
+    
+    # 모든 환경변수가 설정되어 있으면 자동으로 연결 시도
+    if caldav_url and caldav_username and caldav_password:
+        logger.info("환경변수에서 CalDAV 연결 정보를 찾았습니다. 자동으로 연결을 시도합니다.")
+        try:
+            connect_caldav(caldav_url, caldav_username, caldav_password)
+            logger.info("CalDAV 서버에 자동 연결되었습니다.")
+        except Exception as e:
+            logger.error(f"자동 연결 실패: {str(e)}")
+
 # 메인 실행 코드
 if __name__ == "__main__":
     logger.info("MCP-CalDAV 서버를 시작합니다.")
+    
+    _connect_caldav()
     mcp.run()
