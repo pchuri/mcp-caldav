@@ -61,8 +61,19 @@ def get_events(calendar_id: str, time_min: str, time_max: str, expand: bool = Tr
         if category:
             search_params['category'] = category
             
-        # 이벤트 검색 - search 메서드 사용
-        events = calendar.search(**search_params)
+        # 이벤트 검색 - search 메서드 사용, expand 옵션 문제 발생 시 expand=False로 재시도
+        try:
+            events = calendar.search(**search_params)
+        except Exception as e:
+            logger.warning(f"search with expand parameter failed: {str(e)}. Retrying with expand=False.")
+            search_params['expand'] = False
+            try:
+                events = calendar.search(**search_params)
+            except Exception as e2:
+                logger.warning(f"search with expand=False failed: {str(e2)}. Retrying without expand parameter.")
+                if 'expand' in search_params:
+                    del search_params['expand']
+                events = calendar.search(**search_params)
         
         result = []
         for event in events:
@@ -104,6 +115,10 @@ def get_events(calendar_id: str, time_min: str, time_max: str, expand: bool = Tr
         return result
     except Exception as e:
         logger.error(f"이벤트 조회 오류: {str(e)}")
+        error_str = str(e).lower()
+        if "propfinderror" in error_str or "notfounderror" in error_str:
+            logger.warning("PropfindError or NotFoundError encountered; returning empty event list.")
+            return []
         raise ValueError(f"이벤트 가져오기 실패: {str(e)}")
 
 @mcp.tool(name="connect_caldav")
@@ -131,11 +146,6 @@ def connect_caldav() -> dict:
         
         # CalDAV 서버에 연결
         import caldav
-        
-        # URL에 사용자 ID 포함 - LINE Works CalDAV 패턴 사용
-        if not '/principals/users/' in final_server_url and not '/calendars/' in final_server_url:
-            final_server_url = f"{final_server_url.rstrip('/')}/principals/users/{final_username}"
-            logger.info(f"URL에 사용자 ID를 포함시켰습니다: {final_server_url}")
         
         caldav_client = caldav.DAVClient(
             url=final_server_url,
@@ -175,7 +185,7 @@ def create_event(calendar_id: str, summary: str, start: str, end: str,
         raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
     
     try:
-        calendar = principal.calendar(cal_url=calendar_id)
+        calendar = caldav_client.calendar(url=calendar_id)
         
         # 시작 및 종료 시간 변환
         dtstart = datetime.fromisoformat(start.replace('Z', '+00:00'))
@@ -346,6 +356,37 @@ def list_calendars() -> dict:
         logger.error(f"캘린더 목록 조회 오류: {str(e)}")
         raise ValueError(f"캘린더 목록 가져오기 실패: {str(e)}")
 
+@mcp.tool(name="caldav_get_events_today")
+def get_events_today() -> dict:
+    from datetime import datetime, time
+    if principal is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
+    try:
+        calendars = principal.calendars()
+        if calendars:
+            calendar = calendars[0]
+            calendar_id = calendar.url
+        else:
+            logger.warning("No calendars found. Are you sure you have any calendars on the server?")
+            return {"status": "success", "events": [], "message": "캘린더가 없습니다."}
+    except Exception as e:
+        logger.error(f"caldav_get_events_today: 캘린더 목록 조회 실패({str(e)})")
+        return {"status": "error", "events": [], "message": f"캘린더 목록 조회 오류: {str(e)}"}
+    today = datetime.now().date()
+    time_min = datetime.combine(today, time.min).isoformat() + 'Z'
+    time_max = datetime.combine(today, time.max).isoformat() + 'Z'
+    try:
+        events = get_events(calendar_id, time_min, time_max)
+    except Exception as err:
+        error_str = str(err).lower()
+        if "propfinderror" in error_str or "notfounderror" in error_str:
+            logger.warning("caldav_get_events_today: PropfindError or NotFoundError encountered, returning empty event list.")
+            events = []
+        else:
+            logger.error(f"caldav_get_events_today: 이벤트 조회 중 오류: {str(err)}")
+            return {"status": "error", "events": [], "message": f"오늘의 일정 조회 중 오류 발생: {str(err)}"}
+    return {"status": "success", "events": events, "message": f"오늘의 일정 {len(events)}개를 조회했습니다."}
+
 @mcp.prompt()
 def create_event_prompt() -> str:
     """이벤트 생성을 위한 프롬프트"""
@@ -367,24 +408,51 @@ def list_calendars_prompt() -> str:
     먼저 connect_caldav를 호출하여 서버에 연결해야 합니다.
     """
 
-def _connect_caldav():
-    # 환경변수에서 연결 정보 확인
-    caldav_url = os.environ.get('CALDAV_URL')
-    caldav_username = os.environ.get('CALDAV_USERNAME')
-    caldav_password = os.environ.get('CALDAV_PASSWORD')
-    
-    # 모든 환경변수가 설정되어 있으면 자동으로 연결 시도
-    if caldav_url and caldav_username and caldav_password:
-        logger.info("환경변수에서 CalDAV 연결 정보를 찾았습니다. 자동으로 연결을 시도합니다.")
-        try:
-            connect_caldav(caldav_url, caldav_username, caldav_password)
-            logger.info("CalDAV 서버에 자동 연결되었습니다.")
-        except Exception as e:
-            logger.error(f"자동 연결 실패: {str(e)}")
 
 # 메인 실행 코드
+@mcp.tool(name="caldav_get_events_past_week")
+def get_events_past_week() -> dict:
+    from datetime import datetime, timedelta
+    if principal is None:
+        raise ValueError("CalDAV 클라이언트가 설정되지 않았습니다. 먼저 connect_caldav를 호출하세요.")
+    try:
+        calendars = principal.calendars()
+        if not calendars:
+            return {"status": "success", "events": [], "message": "캘린더가 없습니다."}
+        # 타임아웃 방지를 위해 하루 단위로 나누어 조회
+        now = datetime.now()
+        all_events = []
+        for cal in calendars:
+            cal_url = cal.url
+            try:
+                for i in range(7):
+                    day_end = now - timedelta(days=i)
+                    day_start = day_end - timedelta(days=1)
+                    time_min = day_start.isoformat() + 'Z'
+                    time_max = day_end.isoformat() + 'Z'
+                    
+                    for et in ["event","todo","journal"]:
+                        events = get_events(cal_url, time_min, time_max, True, et)
+                        for e in events:
+                            e["calendar_url"] = cal_url
+                            e["type"] = et
+                        all_events.extend(events)
+            except Exception as e:
+                logger.warning(f"Failed to get events from {cal_url}: {str(e)}")
+        return {
+            "status": "success",
+            "events": all_events,
+            "message": f"최근 7일 이벤트 {len(all_events)}개를 조회했습니다."
+        }
+    except Exception as err:
+        logger.error(f"get_events_past_week: 오류: {str(err)}")
+        return {
+            "status": "error",
+            "events": [],
+            "message": str(err)
+        }
+
 if __name__ == "__main__":
     logger.info("MCP-CalDAV 서버를 시작합니다.")
     
-    _connect_caldav()
     mcp.run()
