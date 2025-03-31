@@ -83,7 +83,7 @@ def get_event_urls(calendar_url, calendar_name, days_back=30):
     return event_urls
 
 
-def get_event_details(event_urls, calendar_name, batch_size=5):
+def get_event_details(event_urls, calendar_name, days_back=7, batch_size=5):
     """
     Fetch detailed event information using calendar-multiget for a list of event URLs.
     Process events in batches to avoid memory issues.
@@ -175,6 +175,7 @@ def get_event_details(event_urls, calendar_name, batch_size=5):
                 dtstart_match = re.search(r'DTSTART(?:;(?:TZID=([^:]*?)|VALUE=DATE))?:(.*?)(?:\r?\n)', vevent_data)
                 dtend_match = re.search(r'DTEND(?:;(?:TZID=([^:]*?)|VALUE=DATE))?:(.*?)(?:\r?\n)', vevent_data)
                 uid_match = re.search(r'UID:(.*?)(?:\r?\n)', vevent_data)
+                rrule_match = re.search(r'RRULE:(.*?)(?:\r?\n)', vevent_data)
                 
                 if summary_match and dtstart_match:
                     summary = summary_match.group(1)
@@ -187,9 +188,12 @@ def get_event_details(event_urls, calendar_name, batch_size=5):
                     end_dt_str = dtend_match.group(2) if dtend_match else None
                     end_timezone = dtend_match.group(1) if dtend_match and dtend_match.group(1) else "UTC"
                     
+                    # Check if this is a recurring event
+                    is_recurring = rrule_match is not None
+                    
                     # Format the date for display
                     try:
-                        
+                        # Parse the start date to check if it's within our time range
                         if len(start_dt_str) == 8:  # All-day event (YYYYMMDD)
                             start_date = datetime.strptime(start_dt_str, "%Y%m%d").strftime("%Y-%m-%d")
                             end_date = datetime.strptime(end_dt_str, "%Y%m%d").strftime("%Y-%m-%d") if end_dt_str else start_date
@@ -226,7 +230,18 @@ def get_event_details(event_urls, calendar_name, batch_size=5):
                         end_date = end_dt_str if end_dt_str else start_date
                         is_all_day = False
                     
+                    # For recurring events, check if they're within our time range
+                    # If the original start date is outside our range, it might still have occurrences within range
+                    event_start_date = datetime.strptime(start_date.split()[0], "%Y-%m-%d").date() if ' ' in start_date else datetime.strptime(start_date, "%Y-%m-%d").date()
+                    today = datetime.now().date()
+                    days_back_date = today - timedelta(days=days_back)
+                    
+                    # Skip events that are outside our time range and are not recurring
+                    if event_start_date < days_back_date and not is_recurring:
+                        continue
+                    
                     uid = uid_match.group(1) if uid_match else "Unknown"
+                    rrule = rrule_match.group(1) if rrule_match else None
                     
                     event_info = {
                         'summary': summary,
@@ -237,7 +252,9 @@ def get_event_details(event_urls, calendar_name, batch_size=5):
                         'uid': uid,
                         'calendar': calendar_name,
                         'is_all_day': is_all_day,
-                        'href': href.text
+                        'href': href.text,
+                        'is_recurring': is_recurring,
+                        'rrule': rrule
                     }
                     
                     batch_events.append(event_info)
@@ -273,7 +290,7 @@ def get_recent_events(calendar_url, calendar_name, days_back=30):
         return []
     
     # Step 2: Get event details using calendar-multiget
-    return get_event_details(event_urls, calendar_name)
+    return get_event_details(event_urls, calendar_name, days_back)
 
 
 def get_calendar_list():
@@ -466,7 +483,7 @@ def main():
         for calendar_name, event_urls in calendar_event_urls.items():
             if event_urls:
                 print(f"\nFetching event details for calendar: {calendar_name}...")
-                events = get_event_details(event_urls, calendar_name)
+                events = get_event_details(event_urls, calendar_name, days_to_look_back)
                 all_events.extend(events)
                 print(f"Successfully fetched details for {len(events)} events.")
         
@@ -484,6 +501,17 @@ def main():
                 print(f"  Summary: {event['summary']}")
                 print(f"  Calendar: {event['calendar']}")
                 print(f"  URL: {event['href']}")
+                # Calculate if the event's original start date is within our time range
+                event_start_date = datetime.strptime(event['start'].split()[0], "%Y-%m-%d").date() if ' ' in event['start'] else datetime.strptime(event['start'], "%Y-%m-%d").date()
+                today = datetime.now().date()
+                days_back_date = today - timedelta(days=days_to_look_back)
+                
+                if event['is_recurring']:
+                    if event_start_date < days_back_date:
+                        print(f"  Recurring: Yes (Rule: {event['rrule']}) - Next occurrence within the last {days_to_look_back} days")
+                    else:
+                        print(f"  Recurring: Yes (Rule: {event['rrule']})")
+                
                 if event['is_all_day']:
                     print(f"  Date: {event['start']} (All day)")
                 else:
