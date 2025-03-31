@@ -42,3 +42,5 @@ logs/
 
 # Environment variables
 .env
+
+.venv
